@@ -6,8 +6,6 @@ certifi>=2023.11.17
 
 # Web crawling
 crawl4ai>=0.3.0
-playwright>=1.40.0
-selenium>=4.15.0
 
 # Database
 supabase>=2.0.0

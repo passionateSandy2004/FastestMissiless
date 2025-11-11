@@ -1109,17 +1109,7 @@ async def fetch_html(session: aiohttp.ClientSession, url: str):
 
 async def heavy_render(url: str, expected_selector: str = None):
     async with heavy_sem:
-        # Configure browser for Railway/container environment
-        # Set environment variables for headless Chrome in containers
-        import os
-        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
-        os.environ.setdefault("DISPLAY", ":99")
-        
-        # Simple BrowserConfig - crawl4ai handles container setup internally
-        browser_conf = BrowserConfig(
-            headless=True,
-            # crawl4ai will automatically use appropriate browser args for containers
-        )
+        browser_conf = BrowserConfig(headless=True)
         
         # Detect if it's a Wix site and adjust js_code accordingly
         is_wix = 'wix' in url.lower()
