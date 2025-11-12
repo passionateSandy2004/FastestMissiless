@@ -15,6 +15,7 @@ from urllib.parse import urlparse, urljoin
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, TYPE_CHECKING, Iterable
 import re
+from datetime import datetime, timezone
 
 # Fix Windows console encoding issue with Crawl4AI rich logger
 if sys.platform == "win32":
@@ -90,6 +91,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e
 # Product extraction config
 EXTRACT_PRODUCTS = os.getenv("EXTRACT_PRODUCTS", "true").lower() == "true"
 MAX_PRODUCTS_PER_PAGE = int(os.getenv("MAX_PRODUCTS_PER_PAGE", "50"))
+
+# Watchdog/Timeout config for health checks
+ACTIVITY_TIMEOUT_SECONDS = int(os.getenv("ACTIVITY_TIMEOUT_SECONDS", "300"))  # 5 minutes default
+HEAVY_RENDER_TIMEOUT = int(os.getenv("HEAVY_RENDER_TIMEOUT", "120"))  # 2 minutes per URL
 # -------------------------------------------------
 
 logging.basicConfig(
@@ -106,6 +111,22 @@ _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 # Supabase client (lazy initialization)
 _supabase_client: Optional[Any] = None
+
+# Global activity tracker for watchdog
+_last_activity_time = time.time()
+
+def update_activity():
+    """Update the last activity timestamp."""
+    global _last_activity_time
+    _last_activity_time = time.time()
+
+def check_activity_timeout():
+    """Check if we've been inactive too long and exit if so."""
+    global _last_activity_time
+    inactive_seconds = time.time() - _last_activity_time
+    if inactive_seconds > ACTIVITY_TIMEOUT_SECONDS:
+        logging.error(f"[WATCHDOG] No activity for {inactive_seconds:.0f}s (limit: {ACTIVITY_TIMEOUT_SECONDS}s). Forcing restart...")
+        sys.exit(1)  # Exit with error code to trigger restart
 
 def get_supabase_client() -> Optional[Any]:
     global _supabase_client
@@ -1174,20 +1195,33 @@ async def heavy_render(url: str, expected_selector: str = None):
         logging.info(f"[HEAVY] Initializing browser for {url}")
         try:
             async with AsyncWebCrawler(config=browser_conf) as crawler:
+                update_activity()  # Update after browser init
                 logging.info(f"[HEAVY] Browser initialized, starting crawl for {url}")
+                
                 try:
-                    res = await crawler.arun(url, config=run_conf)
+                    # Add timeout wrapper to prevent hanging
+                    res = await asyncio.wait_for(
+                        crawler.arun(url, config=run_conf),
+                        timeout=HEAVY_RENDER_TIMEOUT
+                    )
+                    update_activity()  # Update after successful crawl
                     logging.info(f"[HEAVY] Crawl completed for {url}")
                     html = getattr(res, "html", "") or getattr(res, "content", "") or ""
                     screenshot = getattr(res, "screenshot", None)
                     return res, html, screenshot
+                except asyncio.TimeoutError:
+                    update_activity()  # Update even on timeout
+                    logging.error(f"[HEAVY] Crawl TIMEOUT after {HEAVY_RENDER_TIMEOUT}s for {url}")
+                    return None, "", None
                 except Exception as e:
+                    update_activity()  # Update even on error
                     error_msg = str(e)
                     logging.error(f"[HEAVY] Crawl error for {url}: {error_msg[:200]}")
                     # If timeout on selector, try again without wait_for
                     if "timeout" in error_msg.lower() or "wait condition failed" in error_msg.lower():
                         logging.info(f"[HEAVY] Selector timeout for {url}, retrying without wait condition")
                     try:
+                        update_activity()  # Update before retry
                         # Retry without wait_for - just wait for page load
                         fallback_conf = CrawlerRunConfig(
                             cache_mode=CacheMode.BYPASS,
@@ -1200,17 +1234,27 @@ async def heavy_render(url: str, expected_selector: str = None):
                             wait_for_images=False,  # Don't wait for images on retry
                             scroll_delay=0.5,
                         )
-                        res = await crawler.arun(url, config=fallback_conf)
+                        res = await asyncio.wait_for(
+                            crawler.arun(url, config=fallback_conf),
+                            timeout=HEAVY_RENDER_TIMEOUT
+                        )
+                        update_activity()  # Update after retry
                         html = getattr(res, "html", "") or getattr(res, "content", "") or ""
                         screenshot = getattr(res, "screenshot", None)
                         return res, html, screenshot
+                    except asyncio.TimeoutError:
+                        update_activity()
+                        logging.error(f"[HEAVY] Fallback also TIMEOUT for {url}")
+                        return None, "", None
                     except Exception as e2:
+                        update_activity()
                         logging.error(f"[HEAVY] Fallback also failed for {url}: {str(e2)[:200]}")
                         return None, "", None
                 else:
                     logging.error(f"[HEAVY] Non-timeout error for {url}: {error_msg[:200]}")
                     return None, "", None
         except Exception as browser_init_error:
+            update_activity()
             logging.error(f"[HEAVY] Browser initialization FAILED for {url}: {str(browser_init_error)[:300]}")
             return None, "", None
 
@@ -1412,19 +1456,27 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
             POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # Default: 60 seconds
             
             while True:
+                update_activity()  # Update at start of each iteration
+                
                 if max_batches and batch_num >= max_batches:
                     logging.info(f"[DB] Reached max_batches limit ({max_batches}). Exiting.")
+                    watchdog.cancel()  # Cancel watchdog before exit
                     break
                 
                 # Fetch pending URLs from database
+                update_activity()  # Update before DB call
                 pending_urls = fetch_pending_urls_from_db(limit=batch_size, worker_id=worker_id)
+                update_activity()  # Update after DB call
                 
                 if not pending_urls:
                     consecutive_empty_batches += 1
+                    update_activity()  # Update even when idle
                     logging.info(f"[DB] No pending URLs found (attempt {consecutive_empty_batches}). "
                                 f"Waiting {POLL_INTERVAL}s before checking again...")
                     # Wait before checking again - continuous background worker behavior
-                    await asyncio.sleep(POLL_INTERVAL)
+                    for _ in range(POLL_INTERVAL):
+                        await asyncio.sleep(1)
+                        update_activity()  # Update every second during sleep
                     continue  # Check again instead of breaking
                 
                 # Reset empty batch counter when we find URLs
@@ -1447,11 +1499,13 @@ async def main_from_db(batch_size: int = 100, max_batches: Optional[int] = None)
                 
                 await asyncio.gather(*tasks)
                 total_processed += len(pending_urls)
+                update_activity()  # Update after batch completion
                 
                 logging.info(f"[DB] Batch {batch_num} completed. Total processed: {total_processed}")
                 
                 # Small delay between batches to avoid overwhelming the database
                 await asyncio.sleep(1)
+                update_activity()  # Update after sleep
         finally:
             if manifest_file:
                 manifest_file.close()
