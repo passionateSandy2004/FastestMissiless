@@ -5,7 +5,7 @@
     "buildCommand": "pip install -r requirements.txt && playwright install --with-deps chromium"
   },
   "deploy": {
-    "startCommand": "DISPLAY=:99 python final.py --db --batch-size 200",
+    "startCommand": "DISPLAY=:99 python restart_wrapper.py python final.py --db --batch-size 200",
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 999
   }
